@@ -1,0 +1,42 @@
+{
+  "name": "omp-cc-switch",
+  "version": "1.0.0",
+  "description": "Bridge CC Switch providers into omp's model registry (proxy slots + direct upstreams)",
+  "type": "module",
+  "license": "MIT",
+  "author": "TommyFang2077",
+  "homepage": "https://github.com/TommyFang2077/omp-cc-switch",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TommyFang2077/omp-cc-switch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/TommyFang2077/omp-cc-switch/issues"
+  },
+  "keywords": [
+    "omp",
+    "oh-my-pi",
+    "pi-coding-agent",
+    "cc-switch",
+    "extension",
+    "plugin"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "omp": {
+    "name": "CC Switch Model Sync",
+    "description": "Sync CC Switch providers into omp — /sync-models, /cc-switch",
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": ">=17.0.0"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  }
+}
