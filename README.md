@@ -1,5 +1,7 @@
 # omp-cc-switch
 
+English | [中文](./README.zh-CN.md)
+
 [omp](https://omp.sh) / [oh-my-pi](https://github.com/can1357/oh-my-pi) plugin that bridges [CC Switch](https://github.com/farion1231/cc-switch) providers into omp’s model registry.
 
 ## What it does
