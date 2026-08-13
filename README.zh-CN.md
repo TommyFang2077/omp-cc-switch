@@ -62,6 +62,39 @@ omp plugin install omp-cc-switch
 | `/cc-switch disable <slug>` | 禁用某个 provider |
 | `/cc-switch enable-all` / `disable-all` | 批量开关 |
 | `/cc-switch models <slug> <ids\|all>` | 限制或重置模型列表 |
+| `/cc-switch roles` | 交互式 agent 角色 → 模型选择器（14 个角色，按 provider 分组） |
+
+## Agent 角色模型配置
+
+omp 内置的 agent（`reviewer`、`scout`、`designer`、`security-reviewer`、`librarian`）缺少 `model: "@roleName"` frontmatter 绑定，会回退到 `modelRoles.default` 而非各自配置的模型。本插件通过两种方式修复：
+
+1. **`/cc-switch roles`** — 交互式三级选择器：
+   - 第一级：选择角色（14 个可配置角色，带中文描述）
+   - 第二级：选择 provider
+   - 第三级：选择该 provider 下的模型
+   - 任意级别按 `Esc` 返回上一级
+
+2. **自动同步** — `/sync-models` 时 `syncAgentModelOverrides()` 把 `modelRoles` 镜像写入 `config.yml` 的 `task.agentModelOverrides`，使 harness 模型解析器按配置路由 subagent，不再回退到 `default`。
+
+### 可配置角色
+
+| 角色 | 说明 |
+| --- | --- |
+| `default` | 默认模型 — 主会话及未指定角色的兜底 |
+| `task` | 通用任务 — 多步骤实施子代理 |
+| `smol` | 快速轻量 — 机械更新与数据采集 |
+| `reviewer` | 代码审查 — 质量与安全分析 |
+| `scout` | 快速探索 — 只读代码搜索与上下文压缩 |
+| `designer` | UI/UX — 设计实现与视觉优化 |
+| `security-reviewer` | 安全审计 — 漏洞发现与风险评估 |
+| `librarian` | 库研究 — 外部库/API 源码考证 |
+| `plan` | 规划 — 实施计划与方案设计 |
+| `slow` | 深度推理 — 最强模型处理复杂判断 |
+| `advisor` | 顾问 — 建议与策略分析 |
+| `commit` | 提交 — 生成 commit 消息 |
+| `vision` | 图像理解 — 截图与图片分析 |
+| `tiny` | 极简 — 最低成本快速任务 |
+
 
 ## 隐私与信任边界
 

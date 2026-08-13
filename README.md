@@ -48,7 +48,7 @@ omp plugin link ./omp-cc-switch
 omp plugin install omp-cc-switch
 ```
 
-Restart omp after install. Verify with `/sync-models --dry-run` or `omp plugin list`.
+Restart omp after install. Verify with `/sync-models` or `omp plugin list`.
 
 ## Commands
 
@@ -62,6 +62,39 @@ Restart omp after install. Verify with `/sync-models --dry-run` or `omp plugin l
 | `/cc-switch disable <slug>` | Disable a provider |
 | `/cc-switch enable-all` / `disable-all` | Bulk toggle |
 | `/cc-switch models <slug> <ids\|all>` | Restrict or reset models |
+| `/cc-switch roles` | Interactive agent role → model picker (14 roles, grouped by provider) |
+
+## Agent role configuration
+
+omp's bundled agents (`reviewer`, `scout`, `designer`, `security-reviewer`, `librarian`) lack a `model: "@roleName"` frontmatter binding, so they fall back to `modelRoles.default` instead of their configured role model. This plugin fixes that in two ways:
+
+1. **`/cc-switch roles`** — interactive three-level picker:
+   - Level 1: pick a role (14 configurable roles with descriptions)
+   - Level 2: pick a provider
+   - Level 3: pick a model under that provider
+   - Press `Esc` at any level to go back
+
+2. **Automatic sync** — during `/sync-models`, `syncAgentModelOverrides()` mirrors `modelRoles` into `task.agentModelOverrides` in `config.yml`, so the harness model resolver routes subagents to their configured model instead of falling back to `default`.
+
+### Configurable roles
+
+| Role | Description |
+| --- | --- |
+| `default` | Main session and fallback |
+| `task` | General-purpose multi-step subagent |
+| `smol` | Fast lightweight — mechanical updates |
+| `reviewer` | Code review — quality & security |
+| `scout` | Read-only exploration & context compression |
+| `designer` | UI/UX implementation |
+| `security-reviewer` | Security audit & vulnerability discovery |
+| `librarian` | External library/API research |
+| `plan` | Implementation planning |
+| `slow` | Deepest reasoning — hardest problems |
+| `advisor` | Advice & strategy |
+| `commit` | Commit message generation |
+| `vision` | Screenshot & image analysis |
+| `tiny` | Lowest cost — quick tasks |
+
 
 ## Privacy / trust
 
