@@ -27,6 +27,8 @@
  *     disable-all          disable every direct provider
  *     models <slug> <ids>  restrict a provider to comma-separated model ids
  *     models <slug> all    reset a provider to all models
+ *     roles                interactive agent role → model picker (reviewer, scout,
+ *                          designer, security-reviewer, librarian, etc.)
  *
  * NOTE: direct providers write their real API key into models.yml (plaintext,
  * same trust boundary as ~/.cc-switch/cc-switch.db and ~/.omp/agent/agent.db).
@@ -122,10 +124,28 @@ const CLAUDE_MODEL_ENV = [
   "ANTHROPIC_MODEL",
 ] as const;
 
-const VALID_SUBS = new Set(["list", "enable", "disable", "enable-all", "disable-all", "models"]);
+const VALID_SUBS = new Set(["list", "enable", "disable", "enable-all", "disable-all", "models", "roles"]);
 
 /** Control row that commits the interactive checkbox selection. */
 const DONE_OPTION = "✔ 完成并同步";
+
+/** Agent roles configurable via /cc-switch roles. */
+const CONFIGURABLE_ROLES: ReadonlyArray<{ role: string; label: string; desc: string }> = [
+  { role: "default", label: "default", desc: "默认模型 — 主会话及未指定角色的兜底" },
+  { role: "task", label: "task", desc: "通用任务 — 多步骤实施子代理" },
+  { role: "smol", label: "smol", desc: "快速轻量 — 机械更新与数据采集" },
+  { role: "reviewer", label: "reviewer", desc: "代码审查 — 质量与安全分析" },
+  { role: "scout", label: "scout", desc: "快速探索 — 只读代码搜索与上下文压缩" },
+  { role: "designer", label: "designer", desc: "UI/UX — 设计实现与视觉优化" },
+  { role: "security-reviewer", label: "security-reviewer", desc: "安全审计 — 漏洞发现与风险评估" },
+  { role: "librarian", label: "librarian", desc: "库研究 — 外部库/API 源码考证" },
+  { role: "plan", label: "plan", desc: "规划 — 实施计划与方案设计" },
+  { role: "slow", label: "slow", desc: "深度推理 — 最强模型处理复杂判断" },
+  { role: "advisor", label: "advisor", desc: "顾问 — 建议与策略分析" },
+  { role: "commit", label: "commit", desc: "提交 — 生成 commit 消息" },
+  { role: "vision", label: "vision", desc: "图像理解 — 截图与图片分析" },
+  { role: "tiny", label: "tiny", desc: "极简 — 最低成本快速任务" },
+];
 
 // ─── db helper ───────────────────────────────────────────────────────────────
 
@@ -765,6 +785,147 @@ async function interactiveSelect(
   return true;
 }
 
+// ─── agent role configuration (/cc-switch roles) ───────────────────────────
+
+/** Parse modelRoles from config.yml into a plain object. */
+function readModelRoles(): Record<string, string> {
+  if (!existsSync(CONFIG_YML)) return {};
+  const lines = readFileSync(CONFIG_YML, "utf8").split("\n");
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^modelRoles\s*:/.test(lines[i])) { start = i + 1; break; }
+  }
+  if (start === -1) return {};
+  const out: Record<string, string> = {};
+  for (let i = start; i < lines.length; i++) {
+    if (/^\S/.test(lines[i])) break;
+    const m = /^\s+(\S+?)\s*:\s*(.+)/.exec(lines[i]);
+    if (m) out[m[1]] = m[2].trim();
+  }
+  return out;
+}
+
+/** Write or update a single role in modelRoles in config.yml. */
+function writeModelRole(role: string, value: string): boolean {
+  if (!existsSync(CONFIG_YML)) return false;
+  const lines = readFileSync(CONFIG_YML, "utf8").split("\n");
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^modelRoles\s*:/.test(lines[i])) { start = i + 1; break; }
+  }
+  if (start === -1) {
+    while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    lines.push("modelRoles:", `  ${role}: ${value}`);
+  } else {
+    let found = false;
+    let end = start;
+    for (end = start; end < lines.length; end++) {
+      if (/^\S/.test(lines[end])) break;
+      const m = /^\s+(\S+?)\s*:/.exec(lines[end]);
+      if (m && m[1] === role) {
+        lines[end] = `  ${role}: ${value}`;
+        found = true;
+        break;
+      }
+    }
+    if (!found) lines.splice(end, 0, `  ${role}: ${value}`);
+  }
+  const tmp = `${CONFIG_YML}.tmp-${process.pid}`;
+  try {
+    writeFileSync(tmp, lines.join("\n"), "utf8");
+    renameSync(tmp, CONFIG_YML);
+  } catch (error) {
+    try { unlinkSync(tmp); } catch { /* temp never written */ }
+    throw error;
+  }
+  return true;
+}
+
+/** Interactive agent role → model configuration via /cc-switch roles. */
+async function roleConfig(ctx: ExtensionCommandContext): Promise<boolean> {
+  const roles = readModelRoles();
+  const rawModels = ctx.models.list().map((m) => `${m.provider}/${m.id}`);
+  const uniqueModels = [...new Set(rawModels)].sort();
+  if (uniqueModels.length === 0) {
+    ctx.ui.notify("没有可用模型。请先 /sync-models 同步 provider。", "warning");
+    return false;
+  }
+  let changed = false;
+  let cursor = 0;
+  for (;;) {
+    const options = CONFIGURABLE_ROLES.map(({ role, desc }) => ({
+      label: `${role}  —  ${desc}`,
+      description: roles[role] ?? "(未设置)",
+      value: role,
+    }));
+    options.push({ label: DONE_OPTION, description: "保存并退出", value: "__done__" });
+    const choice = await ctx.ui.select(
+      "Agent 角色模型配置（选择角色 → 选模型）",
+      options,
+      {
+        initialIndex: Math.min(cursor, options.length - 1),
+        helpText: "up/down 移动  enter 选择  esc 取消",
+        timeout: 300_000,
+      },
+    );
+    if (choice === undefined || choice === DONE_OPTION) break;
+    const selected = options.find((o) => o.label === choice);
+    const roleKey = selected?.value ?? choice;
+    cursor = options.findIndex((o) => o.label === choice);
+    // Group models by provider for easier navigation
+    const byProvider = new Map<string, string[]>();
+    for (const m of uniqueModels) {
+      const slashIdx = m.indexOf("/");
+      const provider = slashIdx > 0 ? m.slice(0, slashIdx) : m;
+      if (!byProvider.has(provider)) byProvider.set(provider, []);
+      byProvider.get(provider)!.push(m);
+    }
+    const providers = [...byProvider.keys()].sort();
+
+    // Level 2: pick provider
+    const providerOptions = providers.map((p) => ({
+      label: p,
+      description: `${byProvider.get(p)!.length} 个模型`,
+    }));
+    providerOptions.push({ label: "↩ 返回角色列表", description: "" });
+    const pickedProvider = await ctx.ui.select(
+      `${roleKey} — 选择 provider（当前：${roles[roleKey] ?? "未设置"}）`,
+      providerOptions,
+      {
+        initialIndex: 0,
+        helpText: "up/down 移动  enter 选择  esc 返回角色列表",
+        timeout: 300_000,
+      },
+    );
+    if (pickedProvider === undefined || pickedProvider === "↩ 返回角色列表") continue;
+
+    // Level 3: pick model under selected provider
+    const providerModels = byProvider.get(pickedProvider)!;
+    const modelOptions = providerModels.map((m) => ({
+      label: m.slice(pickedProvider.length + 1),
+      description: roles[roleKey] === m ? "✔ 当前" : "",
+    }));
+    const pickedModel = await ctx.ui.select(
+      `${roleKey} → ${pickedProvider} — 选择模型`,
+      modelOptions,
+      {
+        initialIndex: 0,
+        helpText: "up/down 移动  enter 确认  esc 返回 provider 列表",
+        timeout: 300_000,
+      },
+    );
+    if (pickedModel === undefined) continue;
+    const fullModelId = `${pickedProvider}/${pickedModel}`;
+    writeModelRole(roleKey, fullModelId);
+    roles[roleKey] = fullModelId;
+    changed = true;
+    ctx.ui.notify(`${roleKey} → ${fullModelId}`, "info");
+  }
+  if (changed) {
+    try { syncAgentModelOverrides(); } catch { /* non-fatal */ }
+  }
+  return changed;
+}
 const PROXY_MODEL_GLOBS = ["cc-claude/*", "cc-codex/*"] as const;
 const DIRECT_MODEL_GLOBS = ["ccs-*/*"] as const;
 
@@ -871,6 +1032,126 @@ function migrateConfigYmlRoles(): boolean {
   return true;
 }
 
+/**
+ * omp's bundled reviewer/scout/designer/security-reviewer/librarian agents lack
+ * a `model: "@roleName"` frontmatter binding, so they fall back to
+ * `modelRoles.default` instead of their configured role model. This mirrors
+ * those roles into `task.agentModelOverrides` so the harness model resolver
+ * (IWn priority 2 — settingsOverride) routes them correctly. Idempotent.
+ */
+const UNBOUND_AGENTS = [
+  "reviewer",
+  "scout",
+  "designer",
+  "security-reviewer",
+  "librarian",
+] as const;
+
+function syncAgentModelOverrides(): boolean {
+  if (!existsSync(CONFIG_YML)) return false;
+  const lines = readFileSync(CONFIG_YML, "utf8").split("\n");
+
+  // Parse modelRoles values
+  let rolesStart = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^modelRoles\s*:/.test(lines[i])) {
+      rolesStart = i + 1;
+      break;
+    }
+  }
+  if (rolesStart === -1) return false;
+
+  const roleValues: Record<string, string> = {};
+  for (let i = rolesStart; i < lines.length; i++) {
+    if (/^\S/.test(lines[i])) break;
+    const m = /^\s+(\S+?)\s*:\s*(.+)/.exec(lines[i]);
+    if (m) roleValues[m[1]] = m[2].trim();
+  }
+
+  // Build desired entries for agents that lack model frontmatter
+  const desired: Record<string, string> = {};
+  for (const agent of UNBOUND_AGENTS) {
+    const v = roleValues[agent];
+    if (v) desired[agent] = v;
+  }
+  if (Object.keys(desired).length === 0) return false;
+
+  // Locate existing task: -> agentModelOverrides: block
+  let taskIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^task\s*:/.test(lines[i])) {
+      taskIdx = i;
+      break;
+    }
+  }
+
+  let amoIdx = -1;
+  let amoChildIndent = "    ";
+  const existing: Record<string, string> = {};
+  if (taskIdx !== -1) {
+    for (let i = taskIdx + 1; i < lines.length; i++) {
+      if (/^\S/.test(lines[i])) break;
+      const amoMatch = /^(\s+)agentModelOverrides\s*:/.exec(lines[i]);
+      if (amoMatch) {
+        amoIdx = i;
+        amoChildIndent = amoMatch[1] + "  ";
+        const childRe = new RegExp(
+          `^${amoChildIndent.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\S+?)\\s*:\\s*(.+)`,
+        );
+        for (let j = i + 1; j < lines.length; j++) {
+          const cm = childRe.exec(lines[j]);
+          if (cm) existing[cm[1]] = cm[2].trim();
+          else break;
+        }
+        break;
+      }
+    }
+  }
+
+  // Check if update needed
+  let changed = false;
+  for (const agent of UNBOUND_AGENTS) {
+    if (desired[agent] !== existing[agent]) { changed = true; break; }
+  }
+  for (const key of Object.keys(existing)) {
+    if (!desired[key]) { changed = true; break; }
+  }
+  if (!changed) return false;
+
+  // Build replacement entries
+  const newEntries = Object.entries(desired).map(
+    ([agent, model]) => `${amoChildIndent}${agent}: ${model}`,
+  );
+
+  if (amoIdx !== -1) {
+    // Replace existing agentModelOverrides children
+    let blockEnd = amoIdx + 1;
+    const childPrefix = amoChildIndent.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    while (blockEnd < lines.length && new RegExp(`^${childPrefix}\\S`).test(lines[blockEnd])) blockEnd++;
+    lines.splice(amoIdx + 1, blockEnd - (amoIdx + 1), ...newEntries);
+  } else if (taskIdx !== -1) {
+    // task: exists, insert agentModelOverrides: under it
+    let insertAt = taskIdx + 1;
+    while (insertAt < lines.length && /^\s/.test(lines[insertAt])) insertAt++;
+    lines.splice(insertAt, 0, "  agentModelOverrides:", ...newEntries);
+  } else {
+    // No task: key — append new block at end
+    while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    lines.push("", "task:", "  agentModelOverrides:", ...newEntries);
+  }
+
+  // Atomic write
+  const tmp = `${CONFIG_YML}.tmp-${process.pid}`;
+  try {
+    writeFileSync(tmp, lines.join("\n"), "utf8");
+    renameSync(tmp, CONFIG_YML);
+  } catch (error) {
+    try { unlinkSync(tmp); } catch { /* temp never written */ }
+    throw error;
+  }
+  return true;
+}
+
 /** Rebuild + write models.yml + register into the live registry. */
 async function runSync(ctx: ExtensionCommandContext): Promise<void> {
   let built: BuiltProviders;
@@ -925,6 +1206,13 @@ async function runSync(ctx: ExtensionCommandContext): Promise<void> {
     }
   } catch (error) {
     notes.push(`config.yml 角色迁移失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+  try {
+    if (syncAgentModelOverrides()) {
+      notes.push("已同步 task.agentModelOverrides（reviewer/scout/designer/security-reviewer/librarian 模型路由）—— 需重启 omp 才生效。");
+    }
+  } catch (error) {
+    notes.push(`config.yml agentModelOverrides 同步失败：${error instanceof Error ? error.message : String(error)}`);
   }
 
   const proxySummary = built.proxy.map((p) => `  ${p.name}: ${p.models.map((m) => m.id).join(", ")}`).join("\n");
@@ -984,6 +1272,17 @@ function handleSubcommand(args: string, ctx: ExtensionCommandContext, selections
     if (rawSub === "enable") selections.providers[slug] = { enabled: true, models: [] };
     else delete selections.providers[slug];
     return true;
+  }
+  if (rawSub === "roles") {
+    if (typeof ctx.ui.select !== "function") {
+      const roles = readModelRoles();
+      ctx.ui.notify(
+        `Agent 角色配置（只读，当前环境不支持交互选择）：\n${CONFIGURABLE_ROLES.map(({ role, desc }) => `  ${role}  ${desc}\n    → ${roles[role] ?? "(未设置)"}`).join("\n")}`,
+        "info",
+      );
+      return false;
+    }
+    return roleConfig(ctx);
   }
   // rawSub === "models"
   const slug = parts[1];
