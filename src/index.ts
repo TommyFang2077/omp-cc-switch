@@ -164,14 +164,28 @@ function readActiveSettings(db: Database, appType: string): { name: string; sett
   return { name: row.name ?? appType, settings: JSON.parse(row.settings_config) as ProviderSettings };
 }
 
+/**
+ * DeepSeek V4 (Flash/Pro) bridged over `openai-responses` falls through to the
+ * catalog's generic xhigh-tier inference (no `max`) because the DeepSeek-aware
+ * ladder is only wired for `openai-completions`/`openrouter`/`ollama-chat`.
+ * The catalog's own V4 entries expose the wire-exact `low`/`high`/`max` scale;
+ * pin that ladder so `/model` shows identical levels for the bridge.
+ */
+function deepseekV4Thinking(id: string): ProviderModelConfig["thinking"] {
+  if (!id.toLowerCase().includes("deepseek-v4")) return undefined;
+  return { mode: "effort", efforts: ["low", "high", "max"] };
+}
+
 function codexModels(settings: ProviderSettings): ProviderModelConfig[] {
   return (settings.modelCatalog?.models ?? []).flatMap((entry) => {
     if (typeof entry.model !== "string" || !entry.model) return [];
     const contextWindow = typeof entry.contextWindow === "number" ? entry.contextWindow : 300_000;
+    const thinking = deepseekV4Thinking(entry.model);
     return [{
       id: entry.model,
       name: typeof entry.displayName === "string" ? entry.displayName : entry.model,
       reasoning: true,
+      ...(thinking ? { thinking } : {}),
       input: ["text", "image"],
       cost: ZERO_COST,
       contextWindow,
@@ -379,10 +393,12 @@ function extractCodexDirect(name: string, settings: ProviderSettings): DirectPro
   }
   const models: ProviderModelConfig[] = modelIds.map((id) => {
     const contextWindow = ctxById.get(id) ?? 300_000;
+    const thinking = deepseekV4Thinking(id);
     return {
       id,
       name: id,
       reasoning: true,
+      ...(thinking ? { thinking } : {}),
       input: ["text", "image"],
       cost: ZERO_COST,
       contextWindow,
@@ -527,6 +543,11 @@ function renderProvider(indent: string, name: string, p: RenderedProvider): stri
     lines.push(`${indent}    - id: ${JSON.stringify(m.id)}`);
     lines.push(`${indent}      name: ${JSON.stringify(m.name)}`);
     lines.push(`${indent}      reasoning: ${m.reasoning}`);
+    if (m.thinking?.efforts) {
+      lines.push(`${indent}      thinking:`);
+      lines.push(`${indent}        mode: ${JSON.stringify(m.thinking.mode)}`);
+      lines.push(`${indent}        efforts: [${m.thinking.efforts.map((e) => JSON.stringify(e)).join(", ")}]`);
+    }
     lines.push(`${indent}      input: [${m.input.join(", ")}]`);
     lines.push(`${indent}      contextWindow: ${m.contextWindow}`);
     lines.push(`${indent}      maxTokens: ${m.maxTokens}`);
