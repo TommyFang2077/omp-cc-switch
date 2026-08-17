@@ -1,6 +1,6 @@
 {
   "name": "omp-cc-switch",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Bridge CC Switch providers into omp's model registry (proxy slots + direct upstreams)",
   "type": "module",
   "license": "MIT",
@@ -27,6 +27,10 @@
     "README.zh-CN.md",
     "LICENSE"
   ],
+  "scripts": {
+    "test": "bun test",
+    "check": "bun test && bun x tsc --noEmit"
+  },
   "omp": {
     "name": "CC Switch Model Sync",
     "description": "Sync CC Switch providers into omp — /sync-models, /cc-switch",
@@ -36,6 +40,11 @@
   },
   "peerDependencies": {
     "@oh-my-pi/pi-coding-agent": ">=17.0.0"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "17.3.4",
+    "@types/bun": "^1.3.14",
+    "typescript": "^7.0.2"
   },
   "engines": {
     "bun": ">=1.1.0"

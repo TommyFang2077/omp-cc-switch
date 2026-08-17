@@ -41,6 +41,15 @@ import type {
   ProviderConfig,
   ProviderModelConfig,
 } from "@oh-my-pi/pi-coding-agent";
+import { inferBridgedThinking } from "./thinking.ts";
+import {
+  ccSwitchPaths,
+  isManagedBridgeProvider,
+  isUsableSecret,
+  SOURCE_ID,
+  splitModelRoleValue,
+  writeSecureFile,
+} from "./util.ts";
 
 // ─── shared types ───────────────────────────────────────────────────────────
 
@@ -52,7 +61,13 @@ type ProviderSettings = {
     models?: Array<{ model?: unknown; displayName?: unknown; contextWindow?: unknown }>;
   };
   options?: { baseURL?: unknown; apiKey?: unknown };
-  models?: Record<string, unknown>;
+  models?: Record<string, unknown> | Array<{ id?: unknown; name?: unknown; context_length?: unknown }>;
+  transport?: unknown;
+  api_key?: unknown;
+  api_mode?: unknown;
+  base_url?: unknown;
+  default_model?: unknown;
+  model?: unknown;
 };
 
 /** What we render to YAML and register. */
@@ -97,16 +112,14 @@ export interface BuiltProviders {
 
 // ─── constants ───────────────────────────────────────────────────────────────
 
-const HOME = process.env.HOME ?? "/home/fsy";
-const DB_PATH = `${HOME}/.cc-switch/cc-switch.db`;
-const CCS_SETTINGS_PATH = `${HOME}/.cc-switch/settings.json`;
-const MODELS_YML = `${HOME}/.omp/agent/models.yml`;
-const CONFIG_YML = `${HOME}/.omp/agent/config.yml`;
-const SELECTIONS_PATH = `${HOME}/.omp/agent/cc-switch-selections.json`;
-const PROXY_HOST = "127.0.0.1";
-const PROXY_PORT = 15721;
-const PROXY_ROOT = `http://${PROXY_HOST}:${PROXY_PORT}`;
-const SOURCE_ID = "cc-switch-model-sync";
+const PATHS = ccSwitchPaths();
+const DB_PATH = PATHS.db;
+const CCS_SETTINGS_PATH = PATHS.settings;
+const MODELS_YML = PATHS.modelsYml;
+const CONFIG_YML = PATHS.configYml;
+const SELECTIONS_PATH = PATHS.selections;
+const DEFAULT_PROXY_HOST = "127.0.0.1";
+const DEFAULT_PROXY_PORT = 15721;
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
 const CLAUDE_ALIASES = [
@@ -151,7 +164,44 @@ const CONFIGURABLE_ROLES: ReadonlyArray<{ role: string; label: string; desc: str
 
 function openDb(): Database {
   if (!existsSync(DB_PATH)) throw new Error(`找不到 CC Switch 数据库：${DB_PATH}`);
-  return new Database(DB_PATH, { readonly: true });
+  const db = new Database(DB_PATH, { readonly: true });
+  db.run("PRAGMA busy_timeout = 5000");
+  return db;
+}
+
+function resolveProxyRoot(db?: Database): string {
+  const owned = db ?? openDb();
+  const closeAfter = !db;
+  try {
+    const row = owned
+      .query("SELECT listen_address, listen_port FROM proxy_config WHERE app_type = 'claude' LIMIT 1")
+      .get() as { listen_address?: string; listen_port?: number } | null;
+    const host = row?.listen_address?.trim() || DEFAULT_PROXY_HOST;
+    const port = row?.listen_port ?? DEFAULT_PROXY_PORT;
+    return `http://${host}:${port}`;
+  } finally {
+    if (closeAfter) owned.close();
+  }
+}
+
+function makeModel(
+  id: string,
+  api: string,
+  contextWindow: number,
+  options?: { name?: string; maxTokens?: number; disableStrictTools?: boolean },
+): ProviderModelConfig {
+  const thinking = inferBridgedThinking(id, api);
+  return {
+    id,
+    name: options?.name ?? id,
+    reasoning: true,
+    ...(thinking ? { thinking } : {}),
+    input: ["text", "image"],
+    cost: ZERO_COST,
+    contextWindow,
+    maxTokens: options?.maxTokens ?? Math.min(contextWindow, 128_000),
+    ...(options?.disableStrictTools ? { compat: { disableStrictTools: true } } : {}),
+  };
 }
 
 // ─── proxy-slot logic (active upstream per app slot) ────────────────────────
@@ -164,36 +214,16 @@ function readActiveSettings(db: Database, appType: string): { name: string; sett
   return { name: row.name ?? appType, settings: JSON.parse(row.settings_config) as ProviderSettings };
 }
 
-/**
- * DeepSeek V4 (Flash/Pro) bridged over `openai-responses` falls through to the
- * catalog's generic xhigh-tier inference (no `max`) because the DeepSeek-aware
- * ladder is only wired for `openai-completions`/`openrouter`/`ollama-chat`.
- * The catalog's own V4 entries expose the wire-exact `low`/`high`/`max` scale;
- * pin that ladder so `/model` shows identical levels for the bridge.
- */
-function deepseekV4Thinking(id: string): ProviderModelConfig["thinking"] {
-  if (!id.toLowerCase().includes("deepseek-v4")) return undefined;
-  return { mode: "effort", efforts: ["low", "high", "max"] };
-}
-
-function codexModels(settings: ProviderSettings): ProviderModelConfig[] {
+function codexModels(settings: ProviderSettings, api: string): ProviderModelConfig[] {
   return (settings.modelCatalog?.models ?? []).flatMap((entry) => {
     if (typeof entry.model !== "string" || !entry.model) return [];
     const contextWindow =
       typeof entry.contextWindow === "number" && entry.contextWindow > 0
         ? entry.contextWindow
         : /\[1m\]/i.test(entry.model) ? 1_000_000 : 300_000;
-    const thinking = deepseekV4Thinking(entry.model);
-    return [{
-      id: entry.model,
+    return [makeModel(entry.model, api, contextWindow, {
       name: typeof entry.displayName === "string" ? entry.displayName : entry.model,
-      reasoning: true,
-      ...(thinking ? { thinking } : {}),
-      input: ["text", "image"],
-      cost: ZERO_COST,
-      contextWindow,
-      maxTokens: Math.min(contextWindow, 128_000),
-    }];
+    })];
   });
 }
 
@@ -203,16 +233,11 @@ function claudeModels(settings: ProviderSettings): ProviderModelConfig[] {
     const target = env[envKey];
     if (typeof target !== "string" || target.length === 0) return [];
     const contextWindow = /\[1m\]/i.test(target) ? 1_000_000 : 200_000;
-    return [{
-      id,
+    return [makeModel(id, "anthropic-messages", contextWindow, {
       name: `${id} -> ${target}`,
-      reasoning: true,
-      input: ["text", "image"],
-      cost: ZERO_COST,
-      contextWindow,
       maxTokens: Math.min(contextWindow, id === "haiku" ? 64_000 : 128_000),
-      compat: { disableStrictTools: true },
-    }];
+      disableStrictTools: true,
+    })];
   });
 }
 
@@ -259,29 +284,29 @@ function shouldPublishProxySlots(selections: SelectionFile): boolean {
 function collectProxySlots(): RenderedProvider[] {
   const db = openDb();
   try {
-    const claude = readActiveSettings(db, "claude");
-    const codex = readActiveSettings(db, "codex");
-    const providers: RenderedProvider[] = [
-      {
-        name: "cc-claude",
-        api: "anthropic-messages",
-        baseUrl: PROXY_ROOT,
-        apiKey: "PROXY_MANAGED",
-        disableStrictTools: true,
-        models: claudeModels(claude.settings),
-      },
-      {
-        name: "cc-codex",
-        api: "openai-responses",
-        baseUrl: `${PROXY_ROOT}/v1`,
-        apiKey: "PROXY_MANAGED",
-        authHeader: true,
-        models: codexModels(codex.settings),
-      },
-    ];
-    const empty = providers.filter((p) => p.models.length === 0);
-    if (empty.length > 0) {
-      throw new Error(`CC Switch 槽位目录为空：${empty.map((p) => p.name).join(", ")}`);
+    const proxyRoot = resolveProxyRoot(db);
+    const providers: RenderedProvider[] = [];
+    for (const [slot, name] of [["claude", "cc-claude"], ["codex", "cc-codex"]] as const) {
+      try {
+        const active = readActiveSettings(db, slot);
+        const api = slot === "claude" ? "anthropic-messages" : "openai-responses";
+        const models = slot === "claude" ? claudeModels(active.settings) : codexModels(active.settings, api);
+        if (models.length === 0) continue;
+        providers.push({
+          name,
+          api,
+          baseUrl: slot === "claude" ? proxyRoot : `${proxyRoot}/v1`,
+          apiKey: "PROXY_MANAGED",
+          disableStrictTools: slot === "claude",
+          authHeader: slot === "codex",
+          models,
+        });
+      } catch {
+        /* skip empty/unconfigured slot */
+      }
+    }
+    if (providers.length === 0) {
+      throw new Error("CC Switch 代理槽位目录为空：cc-claude / cc-codex 均无可用模型");
     }
     return providers;
   } finally {
@@ -340,7 +365,7 @@ function distinctStrings(values: unknown[]): string[] {
   return out;
 }
 
-function extractClaudeDirect(name: string, settings: ProviderSettings): DirectProvider | null {
+function extractClaudeDirect(name: string, settings: ProviderSettings, appType = "claude"): DirectProvider | null {
   const env = (settings.env ?? {}) as Record<string, unknown>;
   const baseUrl = typeof env.ANTHROPIC_BASE_URL === "string" ? env.ANTHROPIC_BASE_URL : "";
   const apiKey =
@@ -348,32 +373,26 @@ function extractClaudeDirect(name: string, settings: ProviderSettings): DirectPr
     (typeof env.ANTHROPIC_API_KEY === "string" && env.ANTHROPIC_API_KEY) ||
     "";
   const rawIds = distinctStrings(CLAUDE_MODEL_ENV.map((k) => env[k]));
-  if (!baseUrl || !apiKey || rawIds.length === 0) return null;
-  // Strip the `[1M]` proxy suffix and dedupe by clean wire id — a provider often
-  // lists both `glm-5.2` and `glm-5.2[1M]`; keep the entry with the larger ctx.
+  if (!baseUrl || !isUsableSecret(apiKey) || rawIds.length === 0) return null;
+  const api = "anthropic-messages";
   const byCleanId = new Map<string, ProviderModelConfig>();
   for (const raw of rawIds) {
     const { id, contextWindow } = stripContextSuffix(raw);
+    const candidate = makeModel(id, api, contextWindow, { disableStrictTools: true });
     const prev = byCleanId.get(id);
-    if (prev && prev.contextWindow >= contextWindow) continue;
-    byCleanId.set(id, {
-      id,
-      name: id,
-      reasoning: true,
-      input: ["text", "image"],
-      cost: ZERO_COST,
-      contextWindow,
-      maxTokens: Math.min(contextWindow, 128_000),
-    });
+    if (prev && prev.contextWindow >= candidate.contextWindow) continue;
+    byCleanId.set(id, candidate);
   }
   const models: ProviderModelConfig[] = [...byCleanId.values()];
+  if (models.length === 0) return null;
+  const slugPrefix = appType === "claude-desktop" ? "ccs-claude-desktop" : "ccs-claude";
   return {
-    slug: `ccs-claude-${slugify(name)}`,
-    appType: "claude",
+    slug: `${slugPrefix}-${slugify(name)}`,
+    appType,
     ccName: name,
     baseUrl,
     apiKey,
-    api: "anthropic-messages",
+    api,
     authHeader: false,
     disableStrictTools: true,
     models,
@@ -384,7 +403,7 @@ function extractCodexDirect(name: string, settings: ProviderSettings): DirectPro
   const apiKey = typeof settings.auth?.OPENAI_API_KEY === "string" ? settings.auth.OPENAI_API_KEY : "";
   const configToml = typeof settings.config === "string" ? settings.config : "";
   const baseUrl = parseCodexBaseUrl(configToml);
-  if (!apiKey || !baseUrl) return null;
+  if (!isUsableSecret(apiKey) || !baseUrl) return null;
   const api = parseCodexWireApi(configToml);
   const catalogIds = distinctStrings((settings.modelCatalog?.models ?? []).map((m) => m.model));
   const topModel = /\nmodel\s*=\s*["']([^"']+)/.exec(configToml)?.[1];
@@ -394,31 +413,19 @@ function extractCodexDirect(name: string, settings: ProviderSettings): DirectPro
   for (const m of settings.modelCatalog?.models ?? []) {
     if (typeof m.model === "string" && typeof m.contextWindow === "number") ctxById.set(m.model, m.contextWindow);
   }
-  // Direct wire ids must drop CC Switch's `[1M]` proxy suffix; dedupe by clean
-  // id keeping the entry with the larger context window (a provider may list
-  // both `deepseek-v4-pro` and `deepseek-v4-pro[1M]`). The catalog window wins
-  // over the suffix, and the suffix wins over the 300K fallback.
   const byCleanId = new Map<string, ProviderModelConfig>();
   for (const rawId of modelIds) {
     const { id, contextWindow: suffixWindow } = stripContextSuffix(rawId, 300_000);
     const catalogWindow = ctxById.get(rawId);
     const contextWindow =
       typeof catalogWindow === "number" && catalogWindow > 0 ? catalogWindow : suffixWindow;
+    const candidate = makeModel(id, api, contextWindow);
     const prev = byCleanId.get(id);
-    if (prev && prev.contextWindow >= contextWindow) continue;
-    const thinking = deepseekV4Thinking(id);
-    byCleanId.set(id, {
-      id,
-      name: id,
-      reasoning: true,
-      ...(thinking ? { thinking } : {}),
-      input: ["text", "image"],
-      cost: ZERO_COST,
-      contextWindow,
-      maxTokens: Math.min(contextWindow, 128_000),
-    });
+    if (prev && prev.contextWindow >= candidate.contextWindow) continue;
+    byCleanId.set(id, candidate);
   }
   const models: ProviderModelConfig[] = [...byCleanId.values()];
+  if (models.length === 0) return null;
   return {
     slug: `ccs-codex-${slugify(name)}`,
     appType: "codex",
@@ -432,30 +439,110 @@ function extractCodexDirect(name: string, settings: ProviderSettings): DirectPro
   };
 }
 
+function mapHermesApi(transport: unknown, apiMode: unknown): { api: string; authHeader: boolean } {
+  const mode = typeof apiMode === "string" ? apiMode : typeof transport === "string" ? transport : "";
+  if (mode === "anthropic" || mode === "anthropic_messages") {
+    return { api: "anthropic-messages", authHeader: false };
+  }
+  if (mode === "codex_responses" || mode === "responses") {
+    return { api: "openai-responses", authHeader: true };
+  }
+  if (mode === "chat_completions" || mode === "chat") {
+    return { api: "openai-completions", authHeader: true };
+  }
+  return { api: "openai-completions", authHeader: true };
+}
+
+function extractHermesDirect(name: string, settings: ProviderSettings): DirectProvider | null {
+  const apiKey = typeof settings.api_key === "string" ? settings.api_key : "";
+  const baseUrl = typeof settings.base_url === "string" ? settings.base_url : "";
+  if (!baseUrl || !isUsableSecret(apiKey)) return null;
+  const { api, authHeader } = mapHermesApi(settings.transport, settings.api_mode);
+  const catalog = Array.isArray(settings.models) ? settings.models : [];
+  const modelIds =
+    catalog.length > 0
+      ? catalog.flatMap((entry) => {
+          if (!entry || typeof entry !== "object") return [];
+          const id = (entry as { id?: unknown }).id;
+          return typeof id === "string" && id.length > 0 ? [id] : [];
+        })
+      : distinctStrings([settings.default_model, settings.model]);
+  if (modelIds.length === 0) return null;
+  const byCleanId = new Map<string, ProviderModelConfig>();
+  for (const rawId of modelIds) {
+    const entry = catalog.find((e) => e && typeof e === "object" && (e as { id?: unknown }).id === rawId) as
+      | { context_length?: unknown }
+      | undefined;
+    const fallbackCtx = typeof entry?.context_length === "number" && entry.context_length > 0 ? entry.context_length : 200_000;
+    const { id, contextWindow } = stripContextSuffix(rawId, fallbackCtx);
+    const candidate = makeModel(id, api, contextWindow, {
+      disableStrictTools: api === "anthropic-messages",
+    });
+    const prev = byCleanId.get(id);
+    if (prev && prev.contextWindow >= candidate.contextWindow) continue;
+    byCleanId.set(id, candidate);
+  }
+  const models = [...byCleanId.values()];
+  if (models.length === 0) return null;
+  return {
+    slug: `ccs-hermes-${slugify(name)}`,
+    appType: "hermes",
+    ccName: name,
+    baseUrl,
+    apiKey,
+    api,
+    authHeader,
+    disableStrictTools: api === "anthropic-messages",
+    models,
+  };
+}
+
+function extractGeminiDirect(name: string, settings: ProviderSettings): DirectProvider | null {
+  const env = settings.env ?? {};
+  const apiKey = typeof env.GEMINI_API_KEY === "string" ? env.GEMINI_API_KEY : "";
+  const baseUrl = typeof env.GOOGLE_GEMINI_BASE_URL === "string" ? env.GOOGLE_GEMINI_BASE_URL : "";
+  if (!baseUrl || !isUsableSecret(apiKey)) return null;
+  const api = "google-generative-ai";
+  const models = [
+    makeModel("gemini-2.5-pro", api, 1_000_000),
+    makeModel("gemini-2.5-flash", api, 1_000_000),
+  ];
+  return {
+    slug: `ccs-gemini-${slugify(name)}`,
+    appType: "gemini",
+    ccName: name,
+    baseUrl,
+    apiKey,
+    api,
+    authHeader: false,
+    disableStrictTools: false,
+    models,
+  };
+}
+
 function extractOpencodeDirect(name: string, settings: ProviderSettings): DirectProvider | null {
   const baseUrl = typeof settings.options?.baseURL === "string" ? settings.options.baseURL : "";
   const apiKey = typeof settings.options?.apiKey === "string" ? settings.options.apiKey : "";
   const modelIds = Object.keys(settings.models ?? {});
-  if (!baseUrl || !apiKey || modelIds.length === 0) return null;
-  const models: ProviderModelConfig[] = modelIds.map((rawId) => {
+  if (!baseUrl || !isUsableSecret(apiKey) || modelIds.length === 0) return null;
+  const api = "openai-completions";
+  const byCleanId = new Map<string, ProviderModelConfig>();
+  for (const rawId of modelIds) {
     const { id, contextWindow } = stripContextSuffix(rawId, 200_000);
-    return {
-      id,
-      name: id,
-      reasoning: true,
-      input: ["text", "image"],
-      cost: ZERO_COST,
-      contextWindow,
-      maxTokens: 128_000,
-    };
-  });
+    const candidate = makeModel(id, api, contextWindow, { maxTokens: 128_000 });
+    const prev = byCleanId.get(id);
+    if (prev && prev.contextWindow >= candidate.contextWindow) continue;
+    byCleanId.set(id, candidate);
+  }
+  const models = [...byCleanId.values()];
+  if (models.length === 0) return null;
   return {
     slug: `ccs-opencode-${slugify(name)}`,
     appType: "opencode",
     ccName: name,
     baseUrl,
     apiKey,
-    api: "openai-completions",
+    api,
     authHeader: true,
     disableStrictTools: false,
     models,
@@ -479,9 +566,17 @@ function collectDirectCatalog(): DirectProvider[] {
         continue;
       }
       let provider: DirectProvider | null = null;
-      if (row.app_type === "claude") provider = extractClaudeDirect(row.name, settings);
-      else if (row.app_type === "codex") provider = extractCodexDirect(row.name, settings);
-      else if (row.app_type === "opencode") provider = extractOpencodeDirect(row.name, settings);
+      if (row.app_type === "claude" || row.app_type === "claude-desktop") {
+        provider = extractClaudeDirect(row.name, settings, row.app_type);
+      } else if (row.app_type === "codex") {
+        provider = extractCodexDirect(row.name, settings);
+      } else if (row.app_type === "opencode") {
+        provider = extractOpencodeDirect(row.name, settings);
+      } else if (row.app_type === "gemini") {
+        provider = extractGeminiDirect(row.name, settings);
+      } else if (row.app_type === "hermes") {
+        provider = extractHermesDirect(row.name, settings);
+      }
       if (!provider) continue;
       let slug = provider.slug;
       let n = 2;
@@ -574,7 +669,7 @@ function renderProvider(indent: string, name: string, p: RenderedProvider): stri
 
 function renderModelsYml(proxy: RenderedProvider[], direct: SelectedProvider[]): string {
   const lines: string[] = [
-    "# CC Switch 模型桥。由 cc-switch-model-sync.ts 生成，请勿手工编辑。",
+    "# CC Switch 模型桥。由 omp-cc-switch 生成，请勿手工编辑。",
     "#",
     ...(proxy.length > 0
       ? [
@@ -606,21 +701,31 @@ function renderModelsYml(proxy: RenderedProvider[], direct: SelectedProvider[]):
 }
 
 function writeModelsYml(content: string): void {
-  const tmp = `${MODELS_YML}.tmp-${process.pid}`;
-  try {
-    writeFileSync(tmp, content, "utf8");
-    renameSync(tmp, MODELS_YML);
-  } catch (error) {
-    try {
-      unlinkSync(tmp);
-    } catch {
-      /* temp never written */
-    }
-    throw error;
-  }
+  writeSecureFile(MODELS_YML, content, 0o600);
 }
 
 // ─── registration ───────────────────────────────────────────────────────────
+
+function syncBridgeProviders(
+  register: (name: string, config: ProviderConfig) => void,
+  unregister: (name: string) => void,
+  listProviders: () => Iterable<string>,
+  providers: RenderedProvider[],
+): string[] {
+  const target = new Set(providers.map((p) => p.name));
+  const droppedProviders: string[] = [];
+  for (const name of new Set(listProviders())) {
+    if (!isManagedBridgeProvider(name)) continue;
+    if (!target.has(name)) {
+      unregister(name);
+      droppedProviders.push(name);
+    }
+  }
+  for (const p of providers) {
+    register(p.name, toProviderConfig(p));
+  }
+  return droppedProviders;
+}
 
 function toProviderConfig(p: RenderedProvider): ProviderConfig {
   const cfg: ProviderConfig = {
@@ -954,10 +1059,12 @@ async function roleConfig(ctx: ExtensionCommandContext): Promise<boolean> {
     );
     if (pickedModel === undefined) continue;
     const fullModelId = `${pickedProvider}/${pickedModel}`;
-    writeModelRole(roleKey, fullModelId);
-    roles[roleKey] = fullModelId;
+    const prevSuffix = splitModelRoleValue(roles[roleKey] ?? "").suffix;
+    const nextValue = prevSuffix ? `${fullModelId}${prevSuffix}` : fullModelId;
+    writeModelRole(roleKey, nextValue);
+    roles[roleKey] = nextValue;
     changed = true;
-    ctx.ui.notify(`${roleKey} → ${fullModelId}`, "info");
+    ctx.ui.notify(`${roleKey} → ${nextValue}`, "info");
   }
   if (changed) {
     try { syncAgentModelOverrides(); } catch { /* non-fatal */ }
@@ -1201,18 +1308,20 @@ async function runSync(ctx: ExtensionCommandContext): Promise<void> {
   }
 
   const all = [...built.proxy, ...built.selected.map(directToRendered)];
-
-  const before = ctx.models
+  const beforeModels = ctx.models
     .list()
-    .filter((m) => all.some((p) => p.name === m.provider))
+    .filter((m) => isManagedBridgeProvider(m.provider))
     .map((m) => `${m.provider}/${m.id}`);
 
-  for (const p of all) {
-    ctx.modelRegistry.registerProvider(p.name, toProviderConfig(p), SOURCE_ID);
-  }
+  const droppedProviders = syncBridgeProviders(
+    (name, config) => ctx.modelRegistry.registerProvider(name, config, SOURCE_ID),
+    (name) => ctx.modelRegistry.unregisterProvider(name),
+    () => ctx.models.list().map((m) => m.provider),
+    all,
+  );
 
   const after = new Set(all.flatMap((p) => p.models.map((m) => `${p.name}/${m.id}`)));
-  const dropped = before.filter((s) => !after.has(s));
+  const droppedModels = beforeModels.filter((s) => !after.has(s));
 
   const notes: string[] = [];
   try {
@@ -1220,13 +1329,16 @@ async function runSync(ctx: ExtensionCommandContext): Promise<void> {
   } catch (error) {
     notes.push(`models.yml 写入失败：${error instanceof Error ? error.message : String(error)}`);
   }
-  if (dropped.length > 0) {
-    notes.push(`已下线：${dropped.join(", ")} —— 检查 config.yml 的 modelRoles。`);
+  if (droppedModels.length > 0) {
+    notes.push(`已下线模型：${droppedModels.join(", ")} —— 检查 config.yml 的 modelRoles。`);
+  }
+  if (droppedProviders.length > 0) {
+    notes.push(`已卸载 provider：${droppedProviders.join(", ")}`);
   }
 
   if (built.proxy.length === 0 && loadSelections().publishProxySlots !== false && !isLocalProxyEnabled()) {
     notes.push(
-      `已跳过 cc-claude/cc-codex：CC Switch 本地代理未开启（enableLocalProxy=false，${PROXY_ROOT} 无监听）。请用 ccs-* 直连，或在 CC Switch 开启本地代理后再 /sync-models。`,
+      `已跳过 cc-claude/cc-codex：CC Switch 本地代理未开启（enableLocalProxy=false，${resolveProxyRoot()} 无监听）。请用 ccs-* 直连，或在 CC Switch 开启本地代理后再 /sync-models。`,
     );
   }
   try {
@@ -1351,7 +1463,7 @@ function registerCcSwitchCommand(pi: ExtensionAPI): void {
     }
     await runSync(ctx);
   };
-  const desc = "管理 CC Switch 直连 provider 选择（list/enable/disable/models，无参数进入交互）";
+  const desc = "管理 CC Switch 直连 provider 选择（list/enable/disable/models/roles，无参数进入交互）";
   pi.registerCommand("cc-switch", { description: desc, handler });
   pi.registerCommand("ccs", { description: desc, handler });
 }
@@ -1359,16 +1471,13 @@ function registerCcSwitchCommand(pi: ExtensionAPI): void {
 // ─── entry point ─────────────────────────────────────────────────────────────
 
 export default function syncCcSwitchModels(pi: ExtensionAPI): void {
-  // Register proxy slots + any already-selected direct providers at load.
-  // Also rewrite models.yml / enabledModels here: omp loads providers from
-  // models.yml independently of registerProvider(), so a stale file would keep
-  // dead cc-claude/cc-codex entries visible even when we skip registering them.
   try {
     const built = buildAll();
     const { proxy, selected } = built;
+    const all = [...proxy, ...selected.map(directToRendered)];
     if (proxy.length === 0 && !isLocalProxyEnabled()) {
       pi.logger.warn?.(
-        `cc-switch: 本地代理未开启，跳过 cc-claude/cc-codex（${PROXY_ROOT}）。使用已启用的 ccs-* 直连 provider。`,
+        `cc-switch: 本地代理未开启，跳过 cc-claude/cc-codex（${resolveProxyRoot()}）。使用已启用的 ccs-* 直连 provider。`,
       );
     }
     try {
@@ -1376,13 +1485,9 @@ export default function syncCcSwitchModels(pi: ExtensionAPI): void {
     } catch (error) {
       pi.logger.error(`cc-switch models.yml 写入失败：${error instanceof Error ? error.message : String(error)}`);
     }
-    try {
-      ensureEnabledModelsNamespace(proxy.length > 0);
-    } catch (error) {
-      pi.logger.error(`cc-switch config.yml 更新失败：${error instanceof Error ? error.message : String(error)}`);
+    for (const p of all) {
+      pi.registerProvider(p.name, toProviderConfig(p));
     }
-    for (const p of proxy) pi.registerProvider(p.name, toProviderConfig(p));
-    for (const s of selected) pi.registerProvider(s.provider.slug, toProviderConfig(directToRendered(s)));
   } catch (error) {
     pi.logger.error(`cc-switch 初始注册失败：${error instanceof Error ? error.message : String(error)}`);
   }
