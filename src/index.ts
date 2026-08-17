@@ -179,7 +179,10 @@ function deepseekV4Thinking(id: string): ProviderModelConfig["thinking"] {
 function codexModels(settings: ProviderSettings): ProviderModelConfig[] {
   return (settings.modelCatalog?.models ?? []).flatMap((entry) => {
     if (typeof entry.model !== "string" || !entry.model) return [];
-    const contextWindow = typeof entry.contextWindow === "number" ? entry.contextWindow : 300_000;
+    const contextWindow =
+      typeof entry.contextWindow === "number" && entry.contextWindow > 0
+        ? entry.contextWindow
+        : /\[1m\]/i.test(entry.model) ? 1_000_000 : 300_000;
     const thinking = deepseekV4Thinking(entry.model);
     return [{
       id: entry.model,
@@ -306,10 +309,10 @@ function slugify(input: string): string {
  * returns HTTP 400 "模型不存在" for `glm-5.2[1M]`). Returns the clean wire id
  * plus the context window the suffix implied.
  */
-function stripContextSuffix(rawId: string): { id: string; contextWindow: number } {
+function stripContextSuffix(rawId: string, fallback = 200_000): { id: string; contextWindow: number } {
   const m = /\[(1m)\]$/i.exec(rawId);
   if (m) return { id: rawId.slice(0, m.index), contextWindow: 1_000_000 };
-  return { id: rawId, contextWindow: 200_000 };
+  return { id: rawId, contextWindow: fallback };
 }
 
 
@@ -391,10 +394,20 @@ function extractCodexDirect(name: string, settings: ProviderSettings): DirectPro
   for (const m of settings.modelCatalog?.models ?? []) {
     if (typeof m.model === "string" && typeof m.contextWindow === "number") ctxById.set(m.model, m.contextWindow);
   }
-  const models: ProviderModelConfig[] = modelIds.map((id) => {
-    const contextWindow = ctxById.get(id) ?? 300_000;
+  // Direct wire ids must drop CC Switch's `[1M]` proxy suffix; dedupe by clean
+  // id keeping the entry with the larger context window (a provider may list
+  // both `deepseek-v4-pro` and `deepseek-v4-pro[1M]`). The catalog window wins
+  // over the suffix, and the suffix wins over the 300K fallback.
+  const byCleanId = new Map<string, ProviderModelConfig>();
+  for (const rawId of modelIds) {
+    const { id, contextWindow: suffixWindow } = stripContextSuffix(rawId, 300_000);
+    const catalogWindow = ctxById.get(rawId);
+    const contextWindow =
+      typeof catalogWindow === "number" && catalogWindow > 0 ? catalogWindow : suffixWindow;
+    const prev = byCleanId.get(id);
+    if (prev && prev.contextWindow >= contextWindow) continue;
     const thinking = deepseekV4Thinking(id);
-    return {
+    byCleanId.set(id, {
       id,
       name: id,
       reasoning: true,
@@ -403,8 +416,9 @@ function extractCodexDirect(name: string, settings: ProviderSettings): DirectPro
       cost: ZERO_COST,
       contextWindow,
       maxTokens: Math.min(contextWindow, 128_000),
-    };
-  });
+    });
+  }
+  const models: ProviderModelConfig[] = [...byCleanId.values()];
   return {
     slug: `ccs-codex-${slugify(name)}`,
     appType: "codex",
@@ -423,15 +437,18 @@ function extractOpencodeDirect(name: string, settings: ProviderSettings): Direct
   const apiKey = typeof settings.options?.apiKey === "string" ? settings.options.apiKey : "";
   const modelIds = Object.keys(settings.models ?? {});
   if (!baseUrl || !apiKey || modelIds.length === 0) return null;
-  const models: ProviderModelConfig[] = modelIds.map((id) => ({
-    id,
-    name: id,
-    reasoning: true,
-    input: ["text", "image"],
-    cost: ZERO_COST,
-    contextWindow: 200_000,
-    maxTokens: 128_000,
-  }));
+  const models: ProviderModelConfig[] = modelIds.map((rawId) => {
+    const { id, contextWindow } = stripContextSuffix(rawId, 200_000);
+    return {
+      id,
+      name: id,
+      reasoning: true,
+      input: ["text", "image"],
+      cost: ZERO_COST,
+      contextWindow,
+      maxTokens: 128_000,
+    };
+  });
   return {
     slug: `ccs-opencode-${slugify(name)}`,
     appType: "opencode",
